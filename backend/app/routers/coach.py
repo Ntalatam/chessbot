@@ -1,76 +1,186 @@
-from fastapi import APIRouter, HTTPException
-from fastapi.responses import StreamingResponse
-from typing import List, Optional, Dict, Any
-from pydantic import BaseModel, Field
+import os
 import json
-import asyncio
 import logging
-import openai
+from typing import Dict, Any, Optional
+from fastapi import APIRouter, HTTPException, Request, status
+from fastapi.responses import JSONResponse, StreamingResponse
+import httpx
+from pydantic import BaseModel
 
-from .. import schemas
-from ..services.llm_service import LLMService
-from ..core.config import settings
-from ..services.engine_service import EngineService
-from ..models.models import Game, User, CoachingSession
-from ..db import get_db, SessionLocal
-from sqlalchemy.orm import Session
-
-router = APIRouter()
+# Configure logging
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-@router.post("/stream_ask", description="Ask the AI coach a question and get a streaming response.")
-async def stream_ask_coach(request: schemas.StreamRequest):
-    """
-    Handles a streaming chat request with the AI coach.
-    """
+from ..core.config import settings
+from ..models.models import Game, User, CoachingSession
+from ..db import get_db, SessionLocal
+from .. import schemas
+from ..services.engine_service import EngineService
+
+router = APIRouter()
+
+# Simple test endpoint to verify the router is working
+@router.get("/test")
+async def test_endpoint():
+    return {"status": "ok", "message": "Coach router is working"}
+
+async def test_openai():
+    """Test endpoint to verify OpenAI connectivity."""
     try:
-        logger.info(f"[AI Coach API] Received payload: {request.dict()}")
-        llm_service = LLMService(api_key=settings.OPENAI_API_KEY)
-        logger.info("[AI Coach API] Initiating stream with OpenAI.")
-        return StreamingResponse(llm_service.stream_chat_response(request.messages), media_type="text/event-stream")
-    except openai.APIError as e:
-        logger.error(f"[AI Coach API] OpenAI API error: {e}", exc_info=True)
-        raise HTTPException(status_code=502, detail=f"Failed to get response from AI provider: {e}")
+        # Use direct HTTP request to avoid client issues
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {settings.OPENAI_API_KEY}"
+        }
+        
+        data = {
+            "model": "gpt-3.5-turbo",
+            "messages": [{"role": "user", "content": "Say this is a test"}],
+            "max_tokens": 10
+        }
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers=headers,
+                json=data,
+                timeout=30.0
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                return {
+                    "status": "success",
+                    "response": result["choices"][0]["message"]["content"]
+                }
+            else:
+                return {
+                    "status": "error",
+                    "error": {
+                        "status_code": response.status_code,
+                        "details": response.text
+                    }
+                }
+                
     except Exception as e:
-        logger.error(f"[AI Coach API] An unexpected error occurred: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail="An unexpected error occurred while processing your request.")
+        logger.error(f"OpenAI test failed: {str(e)}", exc_info=True)
+        return {
+            "status": "error",
+            "error": {
+                "message": str(e),
+                "type": type(e).__name__
+            }
+        }
+
+@router.get("/test-openai")
+async def test_openai_endpoint():
+    """Test endpoint to verify OpenAI connectivity."""
+    return await test_openai()
+
+@router.post("/direct-chat")
+async def direct_chat(request: Request):
+    """Direct chat endpoint using HTTPX instead of OpenAI client."""
+    try:
+        # Get the request data
+        data = await request.json()
+        messages = data.get("messages", [])
+        
+        if not messages:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "No messages provided"}
+            )
+        
+        # Prepare the OpenAI API request
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {settings.OPENAI_API_KEY}"
+        }
+        
+        payload = {
+            "model": "gpt-3.5-turbo",
+            "messages": messages,
+            "max_tokens": 500,
+            "temperature": 0.7
+        }
+        
+        # Make the request to OpenAI
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=30.0
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                return {
+                    "status": "success",
+                    "response": result["choices"][0]["message"]["content"]
+                }
+            else:
+                return JSONResponse(
+                    status_code=response.status_code,
+                    content={
+                        "error": "OpenAI API request failed",
+                        "details": response.text
+                    }
+                )
+                
+    except Exception as e:
+        logger.error(f"Direct chat error: {str(e)}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": "An error occurred",
+                "details": str(e)
+            }
+        )
 
 @router.post("/ask")
 async def ask_coach(request: schemas.CoachingRequest):
     """
-    Ask the AI coach a question about chess. No user account required.
+    Handles a non-streaming chat request with the AI coach.
     """
     try:
-        llm_service = LLMService()
-        engine_service = EngineService()
+        logger.info(f"[AI Coach API] Received ask request: {request.dict()}")
         
-        context = {
-            "user_rating": request.user_rating,
-            "question": request.question
+        # Prepare the OpenAI API request
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {settings.OPENAI_API_KEY}"
         }
         
-        if request.context:
-            context.update(request.context)
+        payload = {
+            "model": "gpt-3.5-turbo",
+            "messages": [
+                {"role": "system", "content": "You are a helpful chess coach."},
+                {"role": "user", "content": request.prompt}
+            ],
+            "max_tokens": 500,
+            "temperature": 0.7
+        }
         
-        if request.fen:
-            try:
-                analysis = engine_service.analyze_position(request.fen)
-                context["position_analysis"] = {
-                    "evaluation": analysis.get("evaluation"),
-                    "best_move": analysis.get("best_move"),
-                    "top_moves": analysis.get("top_moves", [])
-                }
-            except Exception as e:
-                logger.error(f"Error analyzing position: {e}")
-        
-        response = await llm_service.generate_explanation(
-            fen=request.fen or "",
-            move="",
-            context=json.dumps(context)
-        )
-        
-        return {"response": response}
-        
+        # Make the request to OpenAI
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=30.0
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                return {"response": result["choices"][0]["message"]["content"]}
+            else:
+                logger.error(f"OpenAI API error: {response.status_code} - {response.text}")
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail=f"OpenAI API error: {response.text}"
+                )
+                
     except Exception as e:
         logger.error(f"Error in ask_coach: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))

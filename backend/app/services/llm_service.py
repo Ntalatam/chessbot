@@ -1,9 +1,14 @@
 import os
 import json
-from typing import Dict, List, Optional
-from openai import AsyncOpenAI
-from ..core.config import settings
 import logging
+from typing import Dict, List, Optional, Any, AsyncGenerator
+from openai import AsyncOpenAI, OpenAIError
+from openai.types.chat import ChatCompletionChunk
+from ..core.config import settings
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 logger = logging.getLogger(__name__)
 
@@ -12,14 +17,24 @@ class LLMService:
         """Initialize the LLM service with OpenAI API.
 
         Args:
-            api_key: OpenAI API key. If not provided, will try to get from environment.
+            api_key: OpenAI API key. If not provided, will try to get from settings.
         """
-        api_key = api_key or settings.OPENAI_API_KEY
-        if not api_key:
-            raise ValueError("OpenAI API key is required")
+        try:
+            self.api_key = api_key or settings.OPENAI_API_KEY
+            if not self.api_key:
+                raise ValueError("OpenAI API key is required")
 
-        self.client = AsyncOpenAI(api_key=api_key)
-        self.model = "gpt-4"  # Default to GPT-4
+            # Initialize the client with minimal parameters
+            self.client = AsyncOpenAI(
+                api_key=self.api_key,
+                timeout=30.0,  # Add timeout
+            )
+            self.model = "gpt-4"  # Default to GPT-4
+            logger.info("LLMService initialized successfully")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize LLMService: {str(e)}")
+            raise
         
     async def generate_explanation(self, fen: str, move: str, context: str = "") -> str:
         """Generate a natural language explanation for a chess move.
@@ -253,38 +268,69 @@ Start by asking me a few questions to assess my strengths, weaknesses, and learn
 Make sure this is passed as the system role when initializing the message array."""
         }
 
-    async def stream_chat_response(self, messages: list[dict]):
+    async def stream_chat_response(self, messages: list[dict]) -> AsyncGenerator[str, None]:
         """Streams a chat response from the OpenAI API with detailed logging."""
-        logger.info("--- [LLM Service] Attempting to stream chat response ---")
-        if not self.client.api_key:
-            logger.error("[LLM Service] OpenAI API key is not set!")
-            raise ValueError("OpenAI API key is missing.")
-        logger.info("[LLM Service] OpenAI API key is present.")
+        logger.info("--- [LLM Service] Starting stream_chat_response ---")
+        
+        # Validate API key
+        if not hasattr(self, 'api_key') or not self.api_key:
+            error_msg = "OpenAI API key is not set"
+            logger.error(error_msg)
+            raise ValueError(error_msg)
+            
+        # Validate messages
+        if not messages or not isinstance(messages, list):
+            error_msg = "Messages must be a non-empty list of message objects"
+            logger.error(error_msg)
+            raise ValueError(error_msg)
+            
+        for msg in messages:
+            if not isinstance(msg, dict) or 'role' not in msg or 'content' not in msg:
+                error_msg = f"Invalid message format: {msg}"
+                logger.error(error_msg)
+                raise ValueError(error_msg)
 
-        system_prompt = self.get_system_prompt()
-        all_messages = [system_prompt] + messages
-        logger.info(f"[LLM Service] Sending payload to OpenAI: {all_messages}")
-
+        # Prepare messages with system prompt
         try:
+            system_prompt = self.get_system_prompt()
+            all_messages = [system_prompt] + messages
+            
+            # Log the request (without sensitive data)
+            log_messages = [
+                {k: v for k, v in msg.items() if k in ['role', 'content']} 
+                for msg in all_messages
+            ]
+            logger.info(f"[LLM Service] Sending request to OpenAI with {len(log_messages)} messages")
+            logger.debug(f"[LLM Service] Messages: {log_messages}")
+            
+            # Make the API call
             stream = await self.client.chat.completions.create(
-                model="gpt-4",
+                model=self.model,
                 messages=all_messages,
-                stream=True
+                stream=True,
+                temperature=0.7,
+                max_tokens=1000
             )
-            logger.info("[LLM Service] Successfully initiated stream from OpenAI.")
             
-            had_content = False
+            logger.info("[LLM Service] Successfully connected to OpenAI API")
+            
+            # Stream the response
             async for chunk in stream:
-                content = chunk.choices[0].delta.content
-                logger.debug(f"[LLM Service] Received chunk: {chunk.json()}")
-                if content is not None:
-                    had_content = True
-                    yield content
+                if not isinstance(chunk, ChatCompletionChunk):
+                    continue
+                    
+                delta = chunk.choices[0].delta
+                if delta and delta.content:
+                    yield delta.content
             
-            if not had_content:
-                logger.warning("[LLM Service] Stream completed but yielded no content.")
-
+            logger.info("[LLM Service] Stream completed successfully")
+            
+        except OpenAIError as e:
+            error_msg = f"OpenAI API error: {str(e)}"
+            logger.error(f"[LLM Service] {error_msg}", exc_info=True)
+            yield f"[ERROR] {error_msg}"
+            
         except Exception as e:
-            logger.error(f"[LLM Service] An error occurred during OpenAI stream: {e}", exc_info=True)
-            # Re-raise the exception to be caught by the router's error handler
-            raise
+            error_msg = f"Unexpected error: {str(e)}"
+            logger.error(f"[LLM Service] {error_msg}", exc_info=True)
+            yield f"[ERROR] {error_msg}"

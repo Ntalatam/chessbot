@@ -1,0 +1,41 @@
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+*.egg-info/
+*.egg
+
+# Database files
+*.db
+*.sqlite3
+chess_coach.db
+
+# Node.js artifacts
+node_modules/
+dist/
+build/
+.pnp
+.pnp.js
+coverage/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# VSCode
+.vscode/settings.json
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Log files
+*.log
